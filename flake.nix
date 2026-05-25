@@ -19,10 +19,14 @@
     flake-utils.lib.eachDefaultSystem (
       system: let
         pkgs = nixpkgs.legacyPackages.${system};
+        zigPackage =
+          if pkgs.stdenv.hostPlatform.isDarwin
+          then zig.packages.${system}.brew."0.15.2"
+          else zig.packages.${system}."0.15.2";
       in {
         devShells.default = pkgs.mkShell {
           packages = [
-            zig.packages.${system}."0.15.2"
+            zigPackage
             pkgs.cmake
             pkgs.ninja
             pkgs.pinact
