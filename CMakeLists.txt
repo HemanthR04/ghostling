@@ -6,6 +6,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(FetchContent)
 
+# Ghostty's CMake wrapper caches ZIG_EXECUTABLE. When the flake changes the Zig
+# package, an existing build tree can otherwise keep using the old store path.
+# Resolve Zig from the active environment before adding Ghostty so builds follow
+# the flake/dev-shell selection.
+find_program(GHOSTLING_ZIG_EXECUTABLE zig REQUIRED NO_CACHE)
+set(ZIG_EXECUTABLE "${GHOSTLING_ZIG_EXECUTABLE}" CACHE FILEPATH "Path to the Zig compiler" FORCE)
+
 # --- Raylib ------------------------------------------------------------------
 # Use a system-installed raylib if available, otherwise fetch from GitHub.
 set(RAYLIB_VERSION 5.5)
