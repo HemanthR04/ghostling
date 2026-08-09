@@ -1272,16 +1272,27 @@ int main(void)
     // created.
     ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (const void *)decode_png);
 
-    // Create a ghostty virtual terminal with the computed grid and 1000
-    // lines of scrollback.  This holds all the parsed screen state (cells,
-    // cursor, styles, modes) but knows nothing about the pty or the window.
-    GhosttyTerminalOptions opts = { .cols = term_cols, .rows = term_rows, .max_scrollback = 1000 };
-    GhosttyResult err = ghostty_terminal_new(NULL, &terminal, opts);
+    // Create a ghostty virtual terminal with the computed grid.  This holds
+    // all the parsed screen state (cells, cursor, styles, modes) but knows
+    // nothing about the pty or the window.
+    GhosttyResult err = ghostty_terminal_new(NULL, &terminal, term_cols, term_rows);
     if (err != GHOSTTY_SUCCESS) {
         fprintf(stderr, "ghostty_terminal_new failed (%d)\n", err);
         exit_code = 1;
         goto cleanup;
     }
+
+    // Aim for about 1000 lines of scrollback.  Scrollback is configured after
+    // creation rather than through the constructor, and options are passed by
+    // pointer (the value is read during the call, so a local is fine).  This
+    // is only a ballpark: libghostty prunes whole pages at a time, so the
+    // retained history swings well below and above the limit.  The default
+    // byte budget also still applies alongside this line limit, and whichever
+    // is reached first wins -- with many styles or graphemes per page, that is
+    // the byte budget.
+    size_t scrollback_max_lines = 1000;
+    ghostty_terminal_set(terminal, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES,
+        &scrollback_max_lines);
 
     // The terminal options don't include cell pixel dimensions, so
     // issue an initial resize to set them.  Without this, Kitty
@@ -1468,11 +1479,14 @@ int main(void)
         // asked for them.
         bool focused = IsWindowFocused();
         if (focused != prev_focused) {
-            bool focus_mode = false;
+            GhosttyTerminalModeConfig focus_mode = {
+                .mode = GHOSTTY_MODE_FOCUS_EVENT,
+                .value = false,
+            };
             if (!child_exited
-                && ghostty_terminal_mode_get(terminal,
-                       GHOSTTY_MODE_FOCUS_EVENT, &focus_mode) == GHOSTTY_SUCCESS
-                && focus_mode) {
+                && ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE,
+                       &focus_mode) == GHOSTTY_SUCCESS
+                && focus_mode.value) {
                 GhosttyFocusEvent focus_event = focused
                     ? GHOSTTY_FOCUS_GAINED : GHOSTTY_FOCUS_LOST;
                 char focus_buf[8];
