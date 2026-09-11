@@ -7,6 +7,8 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <pwd.h>
 
 #if defined(__APPLE__)
@@ -116,6 +118,11 @@ static void pty_write(int pty_fd, const char *buf, size_t len)
     }
 }
 
+// Forward declaration — defined in the IPC bridge section below. Kept
+// forward-declared here so pty_read (which mirrors output to the IPC
+// client) can stay next to pty_write/pty_spawn as before.
+static void ipc_mirror(int *client_fd, const uint8_t *buf, size_t len);
+
 // Result of draining the pty master fd.
 typedef enum {
     PTY_READ_OK,    // data was drained (or EAGAIN, i.e. nothing available right now)
@@ -127,15 +134,21 @@ typedef enum {
 // ghostty terminal.  The terminal's VT parser will process any escape
 // sequences and update its internal screen/cursor/style state.
 //
+// If ipc_client_fd points at a connected IPC client (see the IPC bridge
+// section below), the same raw bytes are best-effort mirrored to it —
+// this is how an external process observes terminal output.
+//
 // Because the fd is non-blocking, read() returns -1 with EAGAIN once
 // the kernel buffer is empty, at which point we stop.
-static PtyReadResult pty_read(int pty_fd, GhosttyTerminal terminal)
+static PtyReadResult pty_read(int pty_fd, GhosttyTerminal terminal,
+                              int *ipc_client_fd)
 {
     uint8_t buf[4096];
     for (;;) {
         ssize_t n = read(pty_fd, buf, sizeof(buf));
         if (n > 0) {
             ghostty_terminal_vt_write(terminal, buf, (size_t)n);
+            ipc_mirror(ipc_client_fd, buf, (size_t)n);
         } else if (n == 0) {
             // EOF — the child closed its side of the pty.
             return PTY_READ_EOF;
@@ -152,6 +165,125 @@ static PtyReadResult pty_read(int pty_fd, GhosttyTerminal terminal)
             perror("pty read");
             return PTY_READ_ERROR;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IPC bridge (voxterm)
+//
+// Exposes the pty over a local Unix domain socket so an external process
+// (the voxterm voice service) can write input and read output without
+// being the process that owns the window/pty. v1 supports exactly one
+// connected client at a time; a new connection replaces the previous one.
+// Both the listening socket and any accepted client are non-blocking so
+// the render loop never stalls waiting on IPC.
+// ---------------------------------------------------------------------------
+
+#define VOXTERM_SOCKET_PATH "/tmp/voxterm.sock"
+
+// Creates, binds, and listens on the voxterm IPC socket. Removes any
+// stale socket file left behind by a previous run first.
+static int ipc_listen(void)
+{
+    unlink(VOXTERM_SOCKET_PATH);
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("ipc socket");
+        return -1;
+    }
+
+    struct sockaddr_un addr = {0};
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, VOXTERM_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("ipc bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 1) < 0) {
+        perror("ipc listen");
+        close(fd);
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        perror("ipc fcntl O_NONBLOCK");
+        close(fd);
+        return -1;
+    }
+
+    fprintf(stderr, "[voxterm-ipc] listening on %s\n", VOXTERM_SOCKET_PATH);
+    return fd;
+}
+
+// Non-blocking accept. Returns the new client fd, or -1 if no connection
+// is pending. A new connection replaces whatever client was previously
+// connected — the caller is expected to close the old one.
+static int ipc_accept(int listen_fd)
+{
+    int client_fd = accept(listen_fd, NULL, NULL);
+    if (client_fd < 0)
+        return -1;
+
+    int flags = fcntl(client_fd, F_GETFL);
+    if (flags < 0 || fcntl(client_fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        perror("ipc client fcntl O_NONBLOCK");
+        close(client_fd);
+        return -1;
+    }
+    fprintf(stderr, "[voxterm-ipc] client connected\n");
+    return client_fd;
+}
+
+// Drains any bytes waiting from the connected client and writes them
+// straight into the pty, exactly as if they had been typed. If the
+// client has disconnected or errored, closes it and clears *client_fd.
+static void ipc_drain_client(int *client_fd, int pty_fd)
+{
+    if (*client_fd < 0)
+        return;
+
+    char buf[4096];
+    for (;;) {
+        ssize_t n = read(*client_fd, buf, sizeof(buf));
+        if (n > 0) {
+            pty_write(pty_fd, buf, (size_t)n);
+        } else if (n == 0) {
+            fprintf(stderr, "[voxterm-ipc] client disconnected\n");
+            close(*client_fd);
+            *client_fd = -1;
+            return;
+        } else {
+            if (errno == EAGAIN)
+                return;
+            if (errno == EINTR)
+                continue;
+            perror("ipc client read");
+            close(*client_fd);
+            *client_fd = -1;
+            return;
+        }
+    }
+}
+
+// Best-effort mirror of pty output to the connected IPC client, if any.
+// Non-blocking; if the client's socket buffer is full we drop the data
+// rather than stall the render loop — the terminal window itself is
+// still the source of truth, the IPC feed is a best-effort mirror. On a
+// real write error (client gone), closes it and clears *client_fd.
+static void ipc_mirror(int *client_fd, const uint8_t *buf, size_t len)
+{
+    if (*client_fd < 0)
+        return;
+
+    ssize_t n = write(*client_fd, buf, len);
+    if (n < 0 && errno != EAGAIN) {
+        fprintf(stderr, "[voxterm-ipc] client write failed, dropping\n");
+        close(*client_fd);
+        *client_fd = -1;
     }
 }
 
@@ -1256,6 +1388,8 @@ int main(void)
     GhosttyTerminal terminal = NULL;
     pid_t child = -1;
     int pty_fd = -1;
+    int ipc_listen_fd = -1;
+    int ipc_client_fd = -1;
     GhosttyKeyEncoder key_encoder = NULL;
     GhosttyKeyEvent key_event = NULL;
     GhosttyMouseEncoder mouse_encoder = NULL;
@@ -1308,6 +1442,11 @@ int main(void)
         exit_code = 1;
         goto cleanup;
     }
+
+    // Start the voxterm IPC bridge. Non-fatal if it fails (e.g. another
+    // instance already has the socket) — voxterm still works as a normal
+    // terminal, it just won't be reachable over IPC.
+    ipc_listen_fd = ipc_listen();
 
     // Register effects so the terminal can respond to VT queries (device
     // attributes, mode reports, size queries, etc.) that programs like
@@ -1499,10 +1638,26 @@ int main(void)
             prev_focused = focused;
         }
 
+        // Poll the voxterm IPC socket: accept a new client if one is
+        // pending (replacing any previous client), and forward whatever
+        // it's sent us into the pty — same effect as typing it directly.
+        if (ipc_listen_fd >= 0) {
+            int new_client = ipc_accept(ipc_listen_fd);
+            if (new_client >= 0) {
+                if (ipc_client_fd >= 0)
+                    close(ipc_client_fd);
+                ipc_client_fd = new_client;
+            }
+            ipc_drain_client(&ipc_client_fd, pty_fd);
+        }
+
         // Drain any pending output from the shell and update terminal state.
         // Once the child has exited we stop reading — the fd may be closed.
+        // Output is also mirrored to the IPC client (if connected) inside
+        // pty_read, so the external voice service sees the same bytes the
+        // window renders.
         if (!child_exited) {
-            PtyReadResult pty_rc = pty_read(pty_fd, terminal);
+            PtyReadResult pty_rc = pty_read(pty_fd, terminal, &ipc_client_fd);
             if (pty_rc != PTY_READ_OK) {
                 // EOF or error — the child's side of the pty is closed.
                 child_exited = true;
@@ -1596,6 +1751,12 @@ int main(void)
 cleanup:
     UnloadFont(mono_font);
     CloseWindow();
+    if (ipc_client_fd >= 0)
+        close(ipc_client_fd);
+    if (ipc_listen_fd >= 0) {
+        close(ipc_listen_fd);
+        unlink(VOXTERM_SOCKET_PATH);
+    }
     if (pty_fd >= 0)
         close(pty_fd);
     if (child > 0 && !child_reaped) {
